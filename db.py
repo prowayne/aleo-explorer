@@ -15,6 +15,7 @@ from redis.asyncio import Redis
 from aleo_types import *
 from disasm.utils import value_type_to_mode_type_str, plaintext_type_to_str
 from explorer.types import Message as ExplorerMessage
+from models import BlockModel
 from util.global_cache import global_mapping_cache
 
 try:
@@ -44,6 +45,9 @@ class Database:
         self.redis_db = redis_db
         self.pool: AsyncConnectionPool
         self.redis: Redis[str]
+
+        self.current_block = None
+        self.last_block_model = None
 
     async def connect(self):
         try:
@@ -823,6 +827,8 @@ class Database:
 
     @profile
     async def _save_block(self, block: Block):
+        self.current_block = block
+
         async with self.pool.connection() as conn:
             async with conn.transaction():
                 async with conn.cursor() as cur:
@@ -1255,6 +1261,8 @@ class Database:
                         await self._redis_cleanup(self.redis, redis_keys, block.height, False)
 
                         await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseBlockAdded, block.header.metadata.height))
+
+                        self.last_block_model = BlockModel.from_block(block)
                     except Exception as e:
                         await self._redis_cleanup(self.redis, redis_keys, block.height, True)
                         await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
@@ -1819,30 +1827,52 @@ class Database:
                     raise
                 
     async def get_latest_coinbase_target(self) -> int:
+        if self.last_block_model and self.last_block_model.block_hash == str(self.current_block.previous_hash):
+            return self.last_block_model.coinbase_target
+        block_model = await self.get_latest_block_model()
+        return block_model.coinbase_target
+        # async with self.pool.connection() as conn:
+        #     async with conn.cursor() as cur:
+        #         try:
+        #             await cur.execute("SELECT coinbase_target FROM block ORDER BY height DESC LIMIT 1")
+        #             result = await cur.fetchone()
+        #             if result is None:
+        #                 raise RuntimeError("no blocks in database")
+        #             return result['coinbase_target']
+        #         except Exception as e:
+        #             await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
+        #             raise
+
+    async def get_latest_block_model(self):
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 try:
-                    await cur.execute("SELECT coinbase_target FROM block ORDER BY height DESC LIMIT 1")
+                    await cur.execute("SELECT height, previous_hash, block_hash, cumulative_proof_target, coinbase_target FROM block ORDER BY height DESC LIMIT 1")
                     result = await cur.fetchone()
                     if result is None:
                         raise RuntimeError("no blocks in database")
-                    return result['coinbase_target']
+                    self.last_block_model = BlockModel(**result)
+                    return self.last_block_model
                 except Exception as e:
                     await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
                     raise
 
     async def get_latest_cumulative_proof_target(self) -> int:
-        async with self.pool.connection() as conn:
-            async with conn.cursor() as cur:
-                try:
-                    await cur.execute("SELECT cumulative_proof_target FROM block ORDER BY height DESC LIMIT 1")
-                    result = await cur.fetchone()
-                    if result is None:
-                        raise RuntimeError("no blocks in database")
-                    return result['cumulative_proof_target']
-                except Exception as e:
-                    await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
-                    raise
+        if self.last_block_model and self.last_block_model.block_hash == str(self.current_block.previous_hash):
+            return self.last_block_model.cumulative_proof_target
+        block_model = await self.get_latest_block_model()
+        return block_model.cumulative_proof_target
+        # async with self.pool.connection() as conn:
+        #     async with conn.cursor() as cur:
+        #         try:
+        #             await cur.execute("SELECT cumulative_proof_target FROM block ORDER BY height DESC LIMIT 1")
+        #             result = await cur.fetchone()
+        #             if result is None:
+        #                 raise RuntimeError("no blocks in database")
+        #             return result['cumulative_proof_target']
+        #         except Exception as e:
+        #             await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
+        #             raise
 
     async def get_block_by_height(self, height: int):
         async with self.pool.connection() as conn:
