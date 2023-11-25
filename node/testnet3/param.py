@@ -38,4 +38,12 @@ class Testnet3:
         "at1yqpwv0tc6349jg5405vz0acczesgwrsgj8ml75vqjq5xvlhjnsgq23nnzj",
         "at16xptx2nmy3esnq0czrlmw0455tr0eh5lwsy799rh09c2p5hjvyxswgsxlz",
         "at17hhces6pyq6zpldjjjglagvuugkekrwx3feeajz3ltuqd50vyszsjjhc49",
+        "at1y9qwar42k4tfczuae3pcxayg9rx5hgdhjeem5vgw0etaun79xsxsu9r597",
+        "at1pu2sx90vkwpg75gx8nn6adw36tf52f5aepjm0dxeqfpwx9a9qqgqcpdzp0",
+        "at1rw3zedpapn06eshz4tysjskqcnu5c8ttryffau5jmz40gly8qu9q4eaxt9",
+        "at1jutwx9slyl3nvrjje7a89h30ka9yznv2lhnaaahtx38rc3sxxv8qnr5aay",
+        "at19c4j4jfh0kezksfllc3pvs0lka60mkpzxdzq2grvmgqnaxawpuzsg7klcw",
+        "at1dxptf7fe5czsapywq4v3wqssdtszgaufma7a747m7z3fyc22ysyq5v3yyp",
+        "at1z32dca66erulmpetw9yvtwccqkhf292dpqefc3c0ev0u8eskmcpqym0fkq",
+        "at1l2ts29g7zwk9w3uke5w83slhapr8v7zajw4d73xezf8fpszljqzq0y4ck5",
     ]

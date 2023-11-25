@@ -1,15 +1,26 @@
 import os
 import time
+from typing import ParamSpec, Awaitable
 
 import psycopg
 
 from aleo_types import *
 from db import Database
 from disasm.aleo import disasm_instruction, disasm_command
-from util.global_cache import MappingCacheDict
+from util.global_cache import MappingCacheDict, get_program
 from .environment import Registers
 from .instruction import execute_instruction
-from .utils import load_plaintext_from_operand, store_plaintext_to_register, FinalizeState
+from .utils import load_plaintext_from_operand, store_plaintext_to_register, FinalizeState, load_future_from_register
+
+try:
+    from line_profiler import profile
+except ImportError:
+    P = ParamSpec('P')
+    R = TypeVar('R')
+    def profile(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            return await func(*args, **kwargs)
+        return wrapper
 
 
 async def mapping_cache_read(db: Database, program_name: str, mapping_name: str) -> MappingCacheDict:
@@ -20,17 +31,21 @@ async def mapping_cache_read_with_cur(db: Database, cur: psycopg.AsyncCursor[dic
     return await db.get_mapping_cache_with_cur(cur, program_name, mapping_name)
 
 class ExecuteError(Exception):
-    def __init__(self, message: str, exception: Optional[Exception], instruction: str):
+    def __init__(self, message: str, exception: Optional[Exception], instruction: str, program: str = None, function_name: str = None):
         super().__init__(message)
         self.original_exception = exception
         self.instruction = instruction
+        self.program = program
+        self.function_name = function_name
 
 
-async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any]], finalize_state: FinalizeState,
+@profile
+async def execute_finalizer(db: Database, cur: Optional[psycopg.AsyncCursor[dict[str, Any]]], finalize_state: FinalizeState,
                             transition_id: TransitionID, program: Program,
                             function_name: Identifier, inputs: list[Value],
                             mapping_cache: Optional[dict[Field, MappingCacheDict]],
-                            allow_state_change: bool) -> list[dict[str, Any]]:
+                            allow_state_change: bool,
+                            execute_await: bool = False) -> list[dict[str, Any]]:
     registers = Registers()
     operations: list[dict[str, Any]] = []
     function = program.functions[function_name]
@@ -71,7 +86,7 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
                 try:
                     execute_instruction(instruction, program, registers, finalize_state)
                 except (AssertionError, OverflowError, ZeroDivisionError) as e:
-                    raise ExecuteError(str(e), e, disasm_instruction(instruction))
+                    raise ExecuteError(str(e), e, disasm_instruction(instruction), str(program.id), str(function_name))
                 except Exception:
                     registers.dump()
                     raise
@@ -79,13 +94,16 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
             elif isinstance(c, ContainsCommand):
                 mapping_id = Field.loads(cached_get_mapping_id(str(program.id), str(c.mapping)))
                 if mapping_cache is not None and mapping_id not in mapping_cache:
-                    mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    if cur:
+                        mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    else:
+                        mapping_cache[mapping_id] = await mapping_cache_read(db, str(program.id), str(c.mapping))
                 key = load_plaintext_from_operand(c.key, registers, finalize_state)
                 key_id = Field.loads(cached_get_key_id(str(program.id), str(c.mapping), key.dump()))
                 if mapping_cache:
                     contains = key_id in mapping_cache[mapping_id]
                 else:
-                    value = await db.get_mapping_value(str(program.id), str(mapping_id), str(key_id))
+                    value = await db.get_mapping_value(str(program.id), str(c.mapping), str(key_id))
                     contains = value is not None
                 value = PlaintextValue(
                     plaintext=LiteralPlaintext(
@@ -101,13 +119,16 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
             elif isinstance(c, GetCommand | GetOrUseCommand):
                 mapping_id = Field.loads(cached_get_mapping_id(str(program.id), str(c.mapping)))
                 if mapping_cache is not None and mapping_id not in mapping_cache:
-                    mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    if cur:
+                        mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    else:
+                        mapping_cache[mapping_id] = await mapping_cache_read(db, str(program.id), str(c.mapping))
                 key = load_plaintext_from_operand(c.key, registers, finalize_state)
                 key_id = Field.loads(cached_get_key_id(str(program.id), str(c.mapping), key.dump()))
                 if mapping_cache:
                     if key_id not in mapping_cache[mapping_id]:
                         if isinstance(c, GetCommand):
-                            raise ExecuteError(f"key {key} not found in mapping {c.mapping}", None, disasm_command(c))
+                            raise ExecuteError(f"key {key} not found in mapping {c.mapping}", None, disasm_command(c), str(program.id), str(function_name))
                         default = load_plaintext_from_operand(c.default, registers, finalize_state)
                         value = PlaintextValue(plaintext=default)
                     else:
@@ -117,10 +138,10 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
                         if not isinstance(value, PlaintextValue):
                             raise TypeError("invalid value type")
                 else:
-                    value = await db.get_mapping_value(str(program.id), str(mapping_id), str(key_id))
+                    value = await db.get_mapping_value(str(program.id), str(c.mapping), str(key_id))
                     if value is None:
                         if isinstance(c, GetCommand):
-                            raise ExecuteError(f"key {key} not found in mapping {c.mapping}", None, disasm_command(c))
+                            raise ExecuteError(f"key {key} not found in mapping {c.mapping}", None, disasm_command(c), str(program.id), str(function_name))
                         default = load_plaintext_from_operand(c.default, registers, finalize_state)
                         value = PlaintextValue(plaintext=default)
                     else:
@@ -133,7 +154,10 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
             elif isinstance(c, SetCommand):
                 mapping_id = Field.loads(cached_get_mapping_id(str(program.id), str(c.mapping)))
                 if mapping_cache is not None and mapping_id not in mapping_cache:
-                    mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    if cur:
+                        mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    else:
+                        mapping_cache[mapping_id] = await mapping_cache_read(db, str(program.id), str(c.mapping))
                 key = load_plaintext_from_operand(c.key, registers, finalize_state)
                 value = PlaintextValue(plaintext=load_plaintext_from_operand(c.value, registers, finalize_state))
                 key_id = Field.loads(cached_get_key_id(str(program.id), str(c.mapping), key.dump()))
@@ -193,7 +217,10 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
             elif isinstance(c, RemoveCommand):
                 mapping_id = Field.loads(cached_get_mapping_id(str(program.id), str(c.mapping)))
                 if mapping_cache is not None and mapping_id not in mapping_cache:
-                    mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    if cur:
+                        mapping_cache[mapping_id] = await mapping_cache_read_with_cur(db, cur, str(program.id), str(c.mapping))
+                    else:
+                        mapping_cache[mapping_id] = await mapping_cache_read(db, str(program.id), str(c.mapping))
                 key = load_plaintext_from_operand(c.key, registers, finalize_state)
                 key_id = Field.loads(cached_get_key_id(str(program.id), str(c.mapping), key.dump()))
                 if mapping_cache:
@@ -231,13 +258,23 @@ async def execute_finalizer(db: Database, cur: psycopg.AsyncCursor[dict[str, Any
                 pass
 
             elif isinstance(c, AwaitCommand):
-                pass
+                if execute_await:
+                    call_future = load_future_from_register(c.register, registers, finalize_state)
+                    call_program = await get_program(db, str(call_future.program_id))
+                    if not call_program:
+                        raise RuntimeError("program not found")
+
+                    from interpreter.interpreter import _load_input_from_arguments
+                    call_inputs: list[Value] = _load_input_from_arguments(call_future.arguments)
+                    operations.extend(
+                        await execute_finalizer(db, cur, finalize_state, transition_id, call_program, call_future.function_name, call_inputs, mapping_cache, allow_state_change)
+                    )
 
             else:
                 raise NotImplementedError
 
         except IndexError as e:
-            raise ExecuteError(f"r{e} does not exist", e, disasm_command(c))
+            raise ExecuteError(f"r{e} does not exist", e, disasm_command(c), str(program.id), str(function_name))
 
         pc += 1
 

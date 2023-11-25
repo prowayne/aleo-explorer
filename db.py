@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import time
 from collections import defaultdict
 from typing import Awaitable, ParamSpec, cast
@@ -224,7 +225,7 @@ class Database:
     @staticmethod
     async def _insert_transition(conn: psycopg.AsyncConnection[dict[str, Any]], redis_conn: Redis[str],
                                  exe_tx_db_id: Optional[int], fee_db_id: Optional[int],
-                                 transition: Transition, ts_index: int):
+                                 transition: Transition, ts_index: int, is_rejected: bool = False):
         async with conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO transition (transition_id, transaction_execute_id, fee_id, program_id, "
@@ -353,7 +354,7 @@ class Database:
                 (program_db_id, str(transition.function_name))
             )
 
-            if transition.program_id == "credits.aleo":
+            if not is_rejected and transition.program_id == "credits.aleo":
                 transfer_from = None
                 transfer_to = None
                 fee_from = None
@@ -742,37 +743,24 @@ class Database:
                 if ratification.amount == 0:
                     continue
                 account_mapping_id = Field.loads(cached_get_mapping_id("credits.aleo", "account"))
-                await cur.execute(
-                    "SELECT id FROM mapping m WHERE m.mapping_id = %s",
-                    (str(account_mapping_id),)
-                )
-                data = await cur.fetchone()
-                if data is None:
-                    raise RuntimeError("missing current account data")
-                mapping_db_id = data["id"]
-                await cur.execute(
-                    "SELECT key_id, value FROM mapping_value WHERE mapping_id = %s",
-                    (mapping_db_id,)
-                )
-                data = await cur.fetchall()
-
-                current_balances: dict[str, dict[str, Any]] = {}
-                for d in data:
-                    current_balances[str(d["key_id"])] = {
-                        "value": d["value"],
-                    }
 
                 from interpreter.interpreter import global_mapping_cache
+
+                if account_mapping_id not in global_mapping_cache:
+                    from interpreter.finalizer import mapping_cache_read
+                    global_mapping_cache[account_mapping_id] = await mapping_cache_read(self, "credits.aleo", "account")
+
+                current_balances: dict[Field, dict[str, Any]] = global_mapping_cache[account_mapping_id]
 
                 operations: list[dict[str, Any]] = []
                 for address, amount in address_puzzle_rewards.items():
                     key = LiteralPlaintext(literal=Literal(type_=Literal.Type.Address, primitive=Address.loads(address)))
                     key_id = Field.loads(cached_get_key_id("credits.aleo", "account", key.dump()))
-                    if str(key_id) not in current_balances:
+                    if key_id not in current_balances:
                         current_balance = u64()
                     else:
-                        current_balance_data = current_balances[str(key_id)]
-                        value = Value.load(BytesIO(current_balance_data["value"]))
+                        current_balance_data = current_balances[key_id]
+                        value = current_balance_data["value"]
                         if not isinstance(value, PlaintextValue):
                             raise RuntimeError("invalid account value")
                         plaintext = value.plaintext
@@ -830,6 +818,7 @@ class Database:
         self.current_block = block
 
         async with self.pool.connection() as conn:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
             async with conn.transaction():
                 async with conn.cursor() as cur:
                     height = block.height
@@ -843,6 +832,7 @@ class Database:
                         "address_fee",
                     ]
                     await self._backup_redis_hash_key(self.redis, redis_keys, height)
+                    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
 
                     try:
                         if block.height != 0:
@@ -1122,7 +1112,7 @@ class Database:
                                     raise RuntimeError("failed to insert row into database")
                                 execute_transaction_db_id = res["id"]
                                 for ts_index, transition in enumerate(rejected.execution.transitions):
-                                    await self._insert_transition(conn, self.redis, execute_transaction_db_id, None, transition, ts_index)
+                                    await self._insert_transition(conn, self.redis, execute_transaction_db_id, None, transition, ts_index, True)
 
                             update_copy_data: list[tuple[int, str, str, str]] = []
                             for index, finalize_operation in enumerate(confirmed_transaction.finalize):
@@ -1258,15 +1248,19 @@ class Database:
 
                         await self._post_ratify(cur, self.redis, block.height, block.round, block.ratifications.ratifications, address_puzzle_rewards)
 
+                        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
                         await self._redis_cleanup(self.redis, redis_keys, block.height, False)
 
                         await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseBlockAdded, block.header.metadata.height))
 
                         self.last_block_model = BlockModel.from_block(block)
                     except Exception as e:
+                        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
                         await self._redis_cleanup(self.redis, redis_keys, block.height, True)
+                        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
                         await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
                         raise
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
 
     async def save_block(self, block: Block):
         await self._save_block(block)
@@ -2990,6 +2984,11 @@ class Database:
             try:
                 await conn.execute("TRUNCATE TABLE block RESTART IDENTITY CASCADE")
                 await conn.execute("TRUNCATE TABLE mapping RESTART IDENTITY CASCADE")
+                await conn.execute("TRUNCATE TABLE committee_history RESTART IDENTITY CASCADE")
+                await conn.execute("TRUNCATE TABLE committee_history_member RESTART IDENTITY CASCADE")
+                await conn.execute("TRUNCATE TABLE leaderboard RESTART IDENTITY CASCADE")
+                await conn.execute("TRUNCATE TABLE mapping_bonded_history RESTART IDENTITY CASCADE")
+                await conn.execute("TRUNCATE TABLE ratification_genesis_balance RESTART IDENTITY CASCADE")
                 await self.redis.flushall()
             except Exception as e:
                 await self.message_callback(ExplorerMessage(ExplorerMessage.Type.DatabaseError, e))
